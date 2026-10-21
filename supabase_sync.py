@@ -251,3 +251,18 @@ def hydrate_or_push_initial_state(conn: sqlite3.Connection, db_path: Optional[st
                 )
     except Exception:
         pass
+
+
+def sync_delete_lead_to_supabase(lead_id: int, db_path: Optional[str] = None) -> None:
+    """Elimina el negocio en Supabase para mantener sincronización exacta."""
+    if not _is_main_db(db_path):
+        return
+    try:
+        requests.delete(
+            _rest_url("buscaleads_leads"),
+            params={"id": f"eq.{int(lead_id)}"},
+            headers=_headers("return=minimal"),
+            timeout=5,
+        )
+    except Exception:
+        pass

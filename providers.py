@@ -390,6 +390,12 @@ out center {limit};"""
         brand = (tags_dict.get("brand") or "").strip()
         is_chain = int(bool(tags_dict.get("brand:wikidata") or tags_dict.get("brand:wikipedia") or brand))
 
+        # Excluir grandes cadenas, franquicias multinacionales y grandes marcas
+        from business_filter import is_large_business_or_chain
+        is_large, _ = is_large_business_or_chain(name, brand=brand)
+        if is_large or is_chain:
+            return None
+
         web_status, verif_detail = classify_web_status(website, social_url=social_url)
         if web_status == WEB_SOCIAL and not social_url and website:
             social_url = website
@@ -770,6 +776,16 @@ class GooglePlacesProvider(BaseProvider):
 
         # Excluir negocios cerrados permanentemente si Google Places lo indica
         if parsed.get("business_status") == "CLOSED_PERMANENTLY":
+            return None
+
+        # Excluir grandes cadenas, franquicias multinacionales y banca/supermercados
+        from business_filter import is_large_business_or_chain
+        is_large, _ = is_large_business_or_chain(
+            name=parsed.get("name", ""),
+            types=parsed.get("types", []),
+            primary_type=parsed.get("primary_type", ""),
+        )
+        if is_large:
             return None
 
         website_raw = (parsed.get("website") or "").strip()

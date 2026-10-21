@@ -43,6 +43,7 @@ from config import (
 )
 from database import (
     backup_database,
+    delete_lead,
     get_api_usage_stats,
     get_lead,
     get_leads,
@@ -1397,6 +1398,15 @@ elif st.session_state.nav_tab == "negocios":
                         detail="Verificado en persona: el negocio confirma que no tiene web.",
                     )
                     st.session_state.flash_message = "Marcado como «Sin web (verificado por ti)»."
+                    st.rerun()
+
+            with st.container(border=True):
+                st.markdown("**:material/delete_forever: Gestión del negocio**")
+                if st.button("Eliminar negocio permanentemente", icon=":material/delete:", type="secondary", width="stretch", key=f"btn_delete_lead_{lead_id}"):
+                    delete_lead(lead_id)
+                    st.session_state.flash_message = f"Negocio «{lead.get('name')}» eliminado."
+                    st.session_state.sub_screen = None
+                    st.session_state.active_lead_id = None
                     st.rerun()
 
     # ----------------------------------------------------------------------

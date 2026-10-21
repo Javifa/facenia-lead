@@ -26,6 +26,7 @@ from config import (BACKUPS_DIR, DATABASE_PATH, DEFAULT_COMMERCIAL_STATUS,
 from scoring import calculate_lead_score
 from supabase_sync import (
     hydrate_or_push_initial_state,
+    sync_delete_lead_to_supabase,
     sync_interaction_to_supabase,
     sync_lead_to_supabase,
     sync_route_to_supabase,
@@ -549,6 +550,22 @@ def update_lead_review_nfc(
 def delete_lead(lead_id: int, db_path: Optional[str] = None) -> bool:
     conn = _connect(db_path)
     cur = conn.execute("DELETE FROM leads WHERE id=?", (lead_id,))
+    conn.execute("DELETE FROM route_stops WHERE lead_id=?", (lead_id,))
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    if ok:
+        sync_delete_lead_to_supabase(lead_id, db_path=db_path)
+    return ok
+
+
+def remove_route_stop(route_id: int, lead_id: int, db_path: Optional[str] = None) -> bool:
+    """Elimina una parada específica de una ruta y renumera las posiciones restantes."""
+    conn = _connect(db_path)
+    cur = conn.execute("DELETE FROM route_stops WHERE route_id=? AND lead_id=?", (route_id, lead_id))
+    stops = conn.execute("SELECT id FROM route_stops WHERE route_id=? ORDER BY position ASC", (route_id,)).fetchall()
+    for new_pos, row in enumerate(stops, 1):
+        conn.execute("UPDATE route_stops SET position=? WHERE id=?", (new_pos, row["id"]))
     conn.commit()
     ok = cur.rowcount > 0
     conn.close()

@@ -168,6 +168,18 @@ def generate_prospecting_route(
         if (sid and sid in seen_sids) or dedup in seen_hashes:
             continue
 
+        # Excluir grandes cadenas, franquicias multinacionales y marcas corporativas
+        from business_filter import is_large_business_or_chain
+        is_large, _ = is_large_business_or_chain(
+            name=item.get("name", ""),
+            types=item.get("types", []),
+            brand=item.get("brand", ""),
+            primary_type=item.get("primary_type", ""),
+        )
+        if is_large or item.get("is_chain"):
+            excluded_count += 1
+            continue
+
         if exclude_discarded and ((sid and sid in discarded_sids) or dedup in discarded_hashes):
             excluded_count += 1
             continue

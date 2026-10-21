@@ -366,14 +366,26 @@ def _clean_env_api_key(raw_val: str) -> str:
 
 def get_google_maps_api_key() -> str:
     """
-    Obtiene la clave de Google Maps Platform desde el entorno del servidor.
-    Prioriza `GOOGLE_MAPS_API_KEY` y mantiene compatibilidad con `GOOGLE_PLACES_API_KEY`.
+    Obtiene la clave de Google Maps Platform desde el entorno del servidor o ajustes.
+    Prioriza `GOOGLE_MAPS_API_KEY`, `GOOGLE_PLACES_API_KEY` y `app_settings`.
     Nunca expone la clave en logs ni en el frontend.
     """
     primary = _clean_env_api_key(os.getenv("GOOGLE_MAPS_API_KEY", ""))
     if primary:
         return primary
-    return _clean_env_api_key(os.getenv("GOOGLE_PLACES_API_KEY", ""))
+    sec = _clean_env_api_key(os.getenv("GOOGLE_PLACES_API_KEY", ""))
+    if sec:
+        return sec
+    try:
+        import sqlite3
+        conn = sqlite3.connect(DATABASE_PATH)
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'google_maps_api_key'").fetchone()
+        conn.close()
+        if row and row[0]:
+            return _clean_env_api_key(row[0])
+    except Exception:
+        pass
+    return ""
 
 
 def is_google_maps_configured() -> bool:

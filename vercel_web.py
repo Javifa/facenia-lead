@@ -35,6 +35,7 @@ from config import (
     is_supabase_configured,
 )
 from database import (
+    delete_lead,
     get_api_usage_stats,
     get_lead,
     get_leads,
@@ -45,6 +46,7 @@ from database import (
     init_db,
     list_routes,
     record_visit_outcome,
+    remove_route_stop,
     reset_api_usage_stats,
     set_manual_web_status,
     set_setting,
@@ -532,6 +534,23 @@ def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
                 },
             )
 
+        if method == "POST" and path == "/api/leads/delete":
+            data = _read_json_body(environ)
+            lead_id = int(data.get("lead_id") or 0)
+            if not lead_id:
+                return _json_response(start_response, {"ok": False, "error": "ID de local no válido"}, "400 Bad Request")
+            ok = delete_lead(lead_id, db_path=DATABASE_PATH)
+            return _json_response(start_response, {"ok": ok, "deleted_id": lead_id, "state": _build_full_state()})
+
+        if method == "POST" and path == "/api/routes/remove-stop":
+            data = _read_json_body(environ)
+            route_id = int(data.get("route_id") or 0)
+            lead_id = int(data.get("lead_id") or 0)
+            if not route_id or not lead_id:
+                return _json_response(start_response, {"ok": False, "error": "Datos incompletos"}, "400 Bad Request")
+            ok = remove_route_stop(route_id, lead_id, db_path=DATABASE_PATH)
+            return _json_response(start_response, {"ok": ok, "state": _build_full_state()})
+
         if method == "POST" and path == "/api/settings":
             data = _read_json_body(environ)
             action = data.get("action") or "save"
@@ -545,6 +564,10 @@ def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
                     start_response,
                     {"ok": valid, "message": msg, "state": _build_full_state()},
                 )
+
+            if "google_maps_api_key" in data and data["google_maps_api_key"] is not None:
+                clean_k = str(data["google_maps_api_key"]).strip()
+                set_setting("google_maps_api_key", clean_k, DATABASE_PATH)
 
             for key in (
                 "default_data_provider",
@@ -1627,6 +1650,11 @@ def _RENDER_SPA_HTML() -> str:
           <div class="alert-error">
             <strong>Aviso de proveedor:</strong> ${escapeHtml(ROUTE_FORM.error_msg)}
             <div style="margin-top:5px;opacity:0.9;">${escapeHtml(ROUTE_FORM.error_notice)}</div>
+            ${ROUTE_FORM.provider_id === 'google_places' ? `
+              <button class="btn-gold-cta" style="margin-top:10px;padding:9px;font-size:12px;" onclick="ROUTE_FORM.provider_id='osm';ROUTE_FORM.error_msg='';submitGenerateRoute();">
+                ⚡ Generar con OpenStreetMap sin esperas
+              </button>
+            ` : ''}
           </div>
         ` : ''}
       `;
@@ -1643,15 +1671,36 @@ def _RENDER_SPA_HTML() -> str:
        ===================================================================== */
     function renderMapa() {
       const ar = STATE.active_route;
-      if (!ar || !ar.stops || ar.stops.length === 0) {
+      const hasStops = ar && ar.stops && ar.stops.length > 0;
+
+      if (!hasStops) {
+        const totalLeads = (STATE.leads || []).length;
         return `
-          <div class="top-nav-row"><h1 class="screen-title">Ruta a pie</h1></div>
-          <div class="card">
-            Aún no hay una ruta activa. Elige tu zona y cuántos locales quieres visitar.
-            <button class="btn-gold-cta" style="margin-top:12px;" onclick="openCreateRoute()">Nueva ruta</button>
+          <div class="top-nav-row">
+            <div>
+              <div style="font-size:11px;font-weight:800;color:var(--gold);text-transform:uppercase;">Explorador comercial a pie</div>
+              <h1 class="screen-title" style="font-size:20px;">Mapa de Málaga</h1>
+            </div>
+            <button class="btn-gold-cta" style="padding:8px 14px;font-size:12px;" onclick="openCreateRoute()">+ Nueva ruta</button>
+          </div>
+
+          <div id="map-container"></div>
+
+          <div class="card" style="margin-top:12px;border:1px solid rgba(226,179,37,0.3);">
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <strong style="font-size:14px;color:#fff;">🗺️ Mapa a pie 100% activo</strong>
+              <span class="mint-pill">Sin coste de API</span>
+            </div>
+            <div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45;">
+              Visualizando <strong>${totalLeads} locales reales</strong> de tu cartera en Málaga. Pulsa cualquier marcador para abrir su ficha comercial o genera una ruta peatonal optimizada.
+            </div>
+            <button class="btn-gold-cta" style="margin-top:10px;width:100%;" onclick="openCreateRoute()">
+              ⚡ Generar nueva ruta a pie
+            </button>
           </div>
         `;
       }
+
       const idx = Math.min(Math.max(0, Number(ar.current_index || 0)), ar.stops.length - 1);
       const stop = ar.stops[idx];
       const lid = stop.lead_id || stop.id;
@@ -1669,18 +1718,19 @@ def _RENDER_SPA_HTML() -> str:
 
         <div class="stop-card featured" onclick="openLeadDetail(${lid})">
           <div class="stop-num-circle">${idx + 1}</div>
-          <div style="flex:1;">
+          <div style="flex:1;min-width:0;">
             <div style="display:flex;justify-content:space-between;align-items:center;">
-              <strong style="font-size:16px;">${escapeHtml(stop.name)}</strong>
+              <strong style="font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(stop.name)}</strong>
               <span style="font-weight:800;color:var(--gold-bright);font-size:15px;">${stop.score}%</span>
             </div>
             <div class="stop-progress-track">
               <div class="stop-progress-fill" style="width:${stop.score}%;background:var(--gold);"></div>
             </div>
-            <div style="font-size:12px;color:var(--muted);">
+            <div style="font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
               ${stop.rating != null ? `★ ${stop.rating} · ${stop.user_ratings_total || 0} reseñas · ` : ''}${escapeHtml(stop.sector)} · Toca para abrir ficha
             </div>
           </div>
+          <button class="circle-btn" style="width:28px;height:28px;font-size:12px;color:#EF4444;background:transparent;border:none;" title="Quitar de ruta" onclick="event.stopPropagation();removeStopFromRoute(${ar.id}, ${lid})">✕</button>
         </div>
 
         <div style="display:flex;gap:8px;">
@@ -1692,13 +1742,45 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     function initLeafletMap() {
-      const ar = STATE.active_route;
       const container = document.getElementById('map-container');
-      if (!ar || !ar.stops || !container || typeof L === 'undefined') return;
+      if (!container || typeof L === 'undefined') return;
       if (LEAFLET_MAP) {
         LEAFLET_MAP.remove();
         LEAFLET_MAP = null;
       }
+
+      const ar = STATE.active_route;
+      const hasStops = ar && ar.stops && ar.stops.length > 0;
+
+      if (!hasStops) {
+        const defaultLat = 36.7213;
+        const defaultLon = -4.4214;
+        LEAFLET_MAP = L.map('map-container', { zoomControl: false }).setView([defaultLat, defaultLon], 15);
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+          maxZoom: 19,
+          attribution: '&copy; OpenStreetMap · Carto'
+        }).addTo(LEAFLET_MAP);
+
+        const leads = (STATE.leads || []).filter(l => l.lat && l.lon).slice(0, 80);
+        leads.forEach(l => {
+          const isGold = (l.score || 0) >= 80;
+          const bg = isGold ? '#E2B325' : '#4ADE80';
+          const icon = L.divIcon({
+            className: '',
+            html: `
+              <div style="position:relative;display:flex;align-items:center;">
+                <div style="width:26px;height:26px;border-radius:50%;background:${bg};color:#0D0D10;font-weight:800;font-size:11px;display:flex;align-items:center;justify-content:center;border:2px solid #0D0D10;box-shadow:0 0 10px ${bg};">${l.score || 70}</div>
+              </div>
+            `,
+            iconSize: [26, 26],
+            iconAnchor: [13, 13]
+          });
+          const m = L.marker([l.lat, l.lon], { icon }).addTo(LEAFLET_MAP);
+          m.on('click', () => openLeadDetail(l.id));
+        });
+        return;
+      }
+
       const idx = Math.min(Math.max(0, Number(ar.current_index || 0)), ar.stops.length - 1);
       const currentStop = ar.stops[idx] || ar.stops[0];
       const centerLat = currentStop.lat || ar.start_lat || 36.7213;
@@ -1791,9 +1873,9 @@ def _RENDER_SPA_HTML() -> str:
 
         return `
           ${isBest ? `<div class="go-for-it-banner">${l.score} % · ¡Ve a por él!</div>` : ''}
-          <div class="stop-card ${isBest ? 'featured' : ''}" onclick="openLeadDetail(${lid})">
-            <div class="stop-num-circle">${l.position || (idx + 1)}</div>
-            <div style="flex:1;min-width:0;">
+          <div class="stop-card ${isBest ? 'featured' : ''}" style="display:flex;align-items:center;gap:10px;">
+            <div class="stop-num-circle" onclick="openLeadDetail(${lid})">${l.position || (idx + 1)}</div>
+            <div style="flex:1;min-width:0;cursor:pointer;" onclick="openLeadDetail(${lid})">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
                 <strong style="font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(l.name)}</strong>
                 <span style="font-weight:800;font-size:14px;color:${pctColor};">${l.score}%</span>
@@ -1805,6 +1887,7 @@ def _RENDER_SPA_HTML() -> str:
                 ${ratingLine}
               </div>
             </div>
+            <button class="circle-btn" style="width:32px;height:32px;font-size:13px;color:#EF4444;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);flex-shrink:0;" title="Borrar negocio" onclick="event.stopPropagation();deleteSite(${lid})">🗑</button>
           </div>
         `;
       }).join('');
@@ -1994,6 +2077,21 @@ def _RENDER_SPA_HTML() -> str:
           </button>
         </div>
 
+        <!-- Gestión y borrado del negocio -->
+        <div class="card" style="border:1px solid rgba(239,68,68,0.25);background:rgba(239,68,68,0.03);margin-bottom:14px;">
+          <div style="font-size:11px;font-weight:800;color:#FCA5A5;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:8px;">Gestión del negocio</div>
+          <div style="display:flex;gap:8px;">
+            ${STATE.active_route ? `
+              <button class="btn-white-pill" style="flex:1;font-size:12px;color:var(--muted);padding:10px;" onclick="removeStopFromRoute(${STATE.active_route.id}, ${lid})">
+                Quitar de ruta
+              </button>
+            ` : ''}
+            <button class="btn-white-pill" style="flex:1;font-size:12px;color:#EF4444;border-color:rgba(239,68,68,0.4);padding:10px;" onclick="deleteSite(${lid})">
+              🗑 Borrar negocio
+            </button>
+          </div>
+        </div>
+
         <!-- Barra de cierre de visita (Captura 5) -->
         <div class="visit-action-bar">
           <button class="btn-sold" onclick="markVisitOutcome(${lid}, 'Vendido')">✓ Vendido</button>
@@ -2148,6 +2246,15 @@ def _RENDER_SPA_HTML() -> str:
             <option value="osm" ${cfg.default_provider === 'osm' ? 'selected' : ''}>OpenStreetMap · Gratuita</option>
           </select>
 
+          <label>Clave Google Places API (New)</label>
+          <div style="display:flex;gap:8px;">
+            <input id="cfg-google-key" type="password" placeholder="${gOk ? '✓ Clave vinculada en servidor' : 'AIzaSy... (o configurada en Vercel)'}" style="flex:1;" />
+            <button class="btn-white-pill" style="padding:10px 14px;font-size:12px;" onclick="testGoogleKey()">Probar API</button>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px;margin-bottom:8px;">
+            La clave se utiliza únicamente en el servidor para descubrir negocios. El mapa a pie en Leaflet es 100% gratuito y no requiere API.
+          </div>
+
           <label>Máximo de resultados por ruta (5–40)</label>
           <input id="cfg-max-res" type="number" min="5" max="40" value="${cfg.places_max_results || 20}" />
 
@@ -2285,6 +2392,69 @@ def _RENDER_SPA_HTML() -> str:
       render();
     }
 
+    async function deleteSite(leadId) {
+      const lead = findLeadById(leadId);
+      const name = lead ? lead.name : 'este negocio';
+      if (!confirm(`¿Seguro que deseas eliminar permanentemente "${name}"?`)) {
+        return;
+      }
+      try {
+        const res = await apiFetch('/api/leads/delete', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ lead_id: leadId })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (data.state) STATE = data.state;
+          if (SUBSCREEN === 'ficha_negocio' && SELECTED_LEAD_ID === Number(leadId)) {
+            SUBSCREEN = null;
+          }
+          showToast(`✓ Negocio eliminado`);
+          render();
+        } else {
+          showToast(data.error || 'No se pudo eliminar el negocio');
+        }
+      } catch (e) {
+        showToast('Error al eliminar el negocio');
+      }
+    }
+
+    async function removeStopFromRoute(routeId, leadId) {
+      if (!confirm('¿Quitar este local de la ruta actual?')) return;
+      try {
+        const res = await apiFetch('/api/routes/remove-stop', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ route_id: routeId, lead_id: leadId })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (data.state) STATE = data.state;
+          if (SUBSCREEN === 'ficha_negocio') SUBSCREEN = null;
+          showToast('✓ Local retirado de la ruta');
+          render();
+        }
+      } catch (e) {
+        showToast('Error al quitar de la ruta');
+      }
+    }
+
+    async function testGoogleKey() {
+      showToast('Comprobando conexión con Google Places API (New)...');
+      const res = await apiFetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ action: 'validate_key' })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast('✓ ' + (data.message || 'Google Places operativo'));
+      } else {
+        alert('Google Places API: ' + (data.message || 'Clave no válida o API no habilitada'));
+      }
+    }
+
     async function saveSettings() {
       const payload = {
         action: 'save',
@@ -2292,6 +2462,10 @@ def _RENDER_SPA_HTML() -> str:
         places_max_results: Number(document.getElementById('cfg-max-res').value || 20),
         places_max_requests: Number(document.getElementById('cfg-max-req').value || 3)
       };
+      const keyEl = document.getElementById('cfg-google-key');
+      if (keyEl && keyEl.value.trim()) {
+        payload.google_maps_api_key = keyEl.value.trim();
+      }
       const res = await apiFetch('/api/settings', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -2320,3 +2494,13 @@ def _RENDER_SPA_HTML() -> str:
   </script>
 </body>
 </html>"""
+
+
+if __name__ == "__main__":
+    from wsgiref.simple_server import make_server
+    init_db()
+    port = 8503
+    print(f"BuscaLeads WSGI activo en http://127.0.0.1:{port}")
+    server = make_server("127.0.0.1", port, wsgi_app)
+    server.serve_forever()
+
