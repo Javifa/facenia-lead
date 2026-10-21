@@ -1,0 +1,49 @@
+# =====================================================================
+# BuscaLeads (FACENIA) — Archivos excluidos de Git / GitHub / Vercel
+# =====================================================================
+
+# 1. Variables de entorno y secretos (NUNCA subir a GitHub)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.key
+*.pem
+*credentials*.json
+*secret*.json
+
+# 2. Base de datos local y copias de seguridad (datos comerciales privados)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+facenia_leads.db
+backups/
+
+# 3. Entornos virtuales de Python y cachés
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 4. Exportaciones temporales
+exports/
+*.xlsx
+*.csv
+
+# 5. Configuración local de agentes, IDEs y despliegue
+.agents/
+.claude/
+.vercel/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
