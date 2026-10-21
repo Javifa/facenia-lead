@@ -24,6 +24,13 @@ from config import (BACKUPS_DIR, DATABASE_PATH, DEFAULT_COMMERCIAL_STATUS,
                     OUTCOME_RETURN, OUTCOME_SOLD, OUTCOME_TO_STATUS, WEB_FOUND,
                     WEB_NONE, WEB_REVIEW, WEB_SOCIAL, resolve_sector)
 from scoring import calculate_lead_score
+from supabase_sync import (
+    hydrate_or_push_initial_state,
+    sync_interaction_to_supabase,
+    sync_lead_to_supabase,
+    sync_route_to_supabase,
+    sync_setting_to_supabase,
+)
 
 SCHEMA_VERSION = 4
 
@@ -209,6 +216,7 @@ def init_db(db_path: Optional[str] = None) -> None:
     cur.execute("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('schema_version', ?, ?)",
                 (str(SCHEMA_VERSION), _now()))
     conn.commit()
+    hydrate_or_push_initial_state(conn, db_path=db_path)
     conn.close()
 
 
@@ -341,7 +349,9 @@ def save_lead(lead: Dict[str, Any], db_path: Optional[str] = None) -> Tuple[int,
         sets = ", ".join(f"{k}=?" for k in updates)
         cur.execute(f"UPDATE leads SET {sets} WHERE id=?", (*updates.values(), current["id"]))
         conn.commit()
+        updated_row = dict(cur.execute("SELECT * FROM leads WHERE id=?", (current["id"],)).fetchone())
         conn.close()
+        sync_lead_to_supabase(updated_row, db_path=db_path)
         return current["id"], False
 
     record = {f: lead.get(f, "") for f in SOURCE_FIELDS}
@@ -374,7 +384,9 @@ def save_lead(lead: Dict[str, Any], db_path: Optional[str] = None) -> Tuple[int,
     cur.execute(f"INSERT INTO leads ({cols}) VALUES ({marks})", tuple(record.values()))
     lead_id = cur.lastrowid
     conn.commit()
+    inserted_row = dict(cur.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone())
     conn.close()
+    sync_lead_to_supabase(inserted_row, db_path=db_path)
     return lead_id, True
 
 
@@ -446,7 +458,10 @@ def update_lead_commercial(lead_id: int, commercial_status: str, notes: str, nex
          next_followup_date, _now(), lead_id))
     conn.commit()
     ok = cur.rowcount > 0
+    row = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
     conn.close()
+    if row:
+        sync_lead_to_supabase(dict(row), db_path=db_path)
     return ok
 
 
@@ -466,7 +481,10 @@ def set_manual_web_status(lead_id: int, status: str, website: str = "", detail: 
                  (status, lead["website"], detail or lead.get("verification_status", ""),
                   score, priority, json.dumps(reasons, ensure_ascii=False), _now(), lead_id))
     conn.commit()
+    row = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
     conn.close()
+    if row:
+        sync_lead_to_supabase(dict(row), db_path=db_path)
 
 
 def update_lead_review_nfc(
@@ -500,7 +518,10 @@ def update_lead_review_nfc(
     conn = _connect(db_path)
     conn.execute(f"UPDATE leads SET {sets} WHERE id=?", (*updates.values(), lead_id))
     conn.commit()
+    row = conn.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
     conn.close()
+    if row:
+        sync_lead_to_supabase(dict(row), db_path=db_path)
     return get_lead(lead_id, db_path)
 
 
@@ -579,7 +600,11 @@ def save_route(route_meta: Dict[str, Any], stops: List[Dict[str, Any]], db_path:
             ),
         )
     conn.commit()
+    r_row = cur.execute("SELECT * FROM routes WHERE id=?", (route_id,)).fetchone()
+    s_rows = [dict(r) for r in cur.execute("SELECT * FROM route_stops WHERE route_id=?", (route_id,)).fetchall()]
     conn.close()
+    if r_row:
+        sync_route_to_supabase(dict(r_row), s_rows, db_path=db_path)
     return route_id
 
 
@@ -640,7 +665,10 @@ def update_route_progress(route_id: int, current_index: int, status: Optional[st
         cur = conn.execute("UPDATE routes SET current_index=? WHERE id=?", (int(current_index), route_id))
     conn.commit()
     ok = cur.rowcount > 0
+    r_row = conn.execute("SELECT * FROM routes WHERE id=?", (route_id,)).fetchone()
     conn.close()
+    if r_row:
+        sync_route_to_supabase(dict(r_row), None, db_path=db_path)
     return ok
 
 
@@ -749,7 +777,13 @@ def record_visit_outcome(
     )
     interaction_id = cur.lastrowid
     conn.commit()
+    l_row = cur.execute("SELECT * FROM leads WHERE id=?", (lead_id,)).fetchone()
+    i_row = cur.execute("SELECT * FROM interactions WHERE id=?", (interaction_id,)).fetchone()
     conn.close()
+    if l_row:
+        sync_lead_to_supabase(dict(l_row), db_path=db_path)
+    if i_row:
+        sync_interaction_to_supabase(dict(i_row), db_path=db_path)
     return {
         "interaction_id": interaction_id,
         "lead": get_lead(lead_id, db_path),
@@ -1015,10 +1049,12 @@ def get_setting(key: str, default: str = "", db_path: Optional[str] = None) -> s
 
 
 def set_setting(key: str, value: str, db_path: Optional[str] = None) -> None:
+    now = _now()
     conn = _connect(db_path)
-    conn.execute("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?,?,?)", (key, str(value), _now()))
+    conn.execute("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?,?,?)", (key, str(value), now))
     conn.commit()
     conn.close()
+    sync_setting_to_supabase(key, str(value), now, db_path=db_path)
 
 
 def get_api_usage_stats(db_path: Optional[str] = None) -> Dict[str, Any]:

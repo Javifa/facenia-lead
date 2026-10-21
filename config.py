@@ -457,3 +457,24 @@ SECTORS_CATALOG = SECTORS
 NOMINATIM_SEARCH_URL = NOMINATIM_URL
 OSM_USER_AGENT = HTTP_USER_AGENT
 OSM_TIMEOUT_SECONDS = OVERPASS_QUERY_TIMEOUT
+
+
+def get_supabase_url() -> str:
+    """Obtiene la URL del proyecto Supabase desde variables de entorno."""
+    return (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").strip().rstrip("/")
+
+
+def get_supabase_key() -> str:
+    """Obtiene la clave de API de Supabase desde variables de entorno."""
+    return (
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        or os.getenv("SUPABASE_KEY")
+        or os.getenv("SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        or ""
+    ).strip()
+
+
+def is_supabase_configured() -> bool:
+    """Indica si la conexión con Supabase está configurada en el entorno."""
+    return bool(get_supabase_url() and get_supabase_key())
