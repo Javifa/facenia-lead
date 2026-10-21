@@ -220,8 +220,19 @@ def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
     """Punto de entrada WSGI estándar para Vercel (`@vercel/python`) y servidores HTTP."""
     init_db(DATABASE_PATH)
     method = (environ.get("REQUEST_METHOD") or "GET").upper()
-    path = environ.get("PATH_INFO") or "/"
+    raw_path = environ.get("PATH_INFO") or "/"
     query = parse_qs(environ.get("QUERY_STRING") or "")
+
+    rewritten = (query.get("__path") or [""])[0].strip()
+    if rewritten:
+        path = rewritten if rewritten.startswith("/") else f"/{rewritten}"
+    elif raw_path in ("/app.py", "/app"):
+        path = "/"
+    else:
+        path = raw_path
+
+    if path in ("/app.py", "/app", ""):
+        path = "/"
 
     try:
         if method == "GET" and path == "/favicon.ico":

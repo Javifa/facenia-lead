@@ -379,9 +379,17 @@ def test_vercel_wsgi_entrypoint_and_api(tmp_path, monkeypatch):
     assert "BuscaLeads" in html_str
     assert "Google Places API (New)" in html_str
 
-    # 2. GET /api/state -> JSON
+    # 1b. GET /app.py (Vercel rewrite behaviour) -> HTML SPA
+    vercel_root_chunks = vercel_entry.app(
+        {"REQUEST_METHOD": "GET", "PATH_INFO": "/app.py"},
+        start_response,
+    )
+    assert statuses[-1] == "200 OK"
+    assert "BuscaLeads" in b"".join(vercel_root_chunks).decode("utf-8")
+
+    # 2. GET /api/state (both direct and via Vercel __path rewrite) -> JSON
     state_chunks = vercel_entry.app(
-        {"REQUEST_METHOD": "GET", "PATH_INFO": "/api/state"},
+        {"REQUEST_METHOD": "GET", "PATH_INFO": "/app.py", "QUERY_STRING": "__path=/api/state"},
         start_response,
     )
     state_data = json.loads(b"".join(state_chunks).decode("utf-8"))

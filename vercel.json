@@ -1,8 +1,16 @@
 {
   "rewrites": [
     {
+      "source": "/api/(.*)",
+      "destination": "/app.py?__path=/api/$1"
+    },
+    {
+      "source": "/favicon.ico",
+      "destination": "/app.py?__path=/favicon.ico"
+    },
+    {
       "source": "/(.*)",
-      "destination": "/app.py"
+      "destination": "/app.py?__path=/$1"
     }
   ]
 }
