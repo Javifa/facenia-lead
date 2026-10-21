@@ -459,19 +459,27 @@ OSM_USER_AGENT = HTTP_USER_AGENT
 OSM_TIMEOUT_SECONDS = OVERPASS_QUERY_TIMEOUT
 
 
+DEFAULT_SUPABASE_URL = "https://zkxyvhrqxetxomrwbajm.supabase.co"
+DEFAULT_SUPABASE_KEY = "sb_publishable_xSVzOuaHinUoEYCQVa00qg_1-nMzUx8"
+
+
 def get_supabase_url() -> str:
-    """Obtiene la URL del proyecto Supabase desde variables de entorno."""
-    return (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").strip().rstrip("/")
+    """Obtiene la URL del proyecto Supabase (por variable o por defecto a Facenia)."""
+    return (
+        os.getenv("SUPABASE_URL")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+        or DEFAULT_SUPABASE_URL
+    ).strip().rstrip("/")
 
 
 def get_supabase_key() -> str:
-    """Obtiene la clave de API de Supabase desde variables de entorno."""
+    """Obtiene la clave pública de Supabase (por variable o por defecto a Facenia)."""
     return (
         os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         or os.getenv("SUPABASE_KEY")
         or os.getenv("SUPABASE_ANON_KEY")
         or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-        or ""
+        or DEFAULT_SUPABASE_KEY
     ).strip()
 
 

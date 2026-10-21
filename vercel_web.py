@@ -1132,7 +1132,7 @@ def _RENDER_SPA_HTML() -> str:
       const res = await fetch('/api/state');
       STATE = await res.json();
       if (STATE && STATE.settings) {
-        ROUTE_FORM.provider_id = STATE.settings.default_provider || 'google_places';
+        ROUTE_FORM.provider_id = STATE.google_Configured ? (STATE.settings.default_provider || 'google_places') : 'osm';
       }
       render();
     }
