@@ -348,3 +348,73 @@ def test_api_usage_counter(tmp_path):
     assert stats1["last_request_at"] != ""
 
 
+def test_vercel_wsgi_entrypoint_and_api(tmp_path, monkeypatch):
+    import io
+    import json
+    import app as vercel_entry
+    import vercel_web
+
+    db_file = str(tmp_path / "test_vercel.db")
+    monkeypatch.setattr(vercel_web, "DATABASE_PATH", db_file)
+    monkeypatch.delenv("GOOGLE_MAPS_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_PLACES_API_KEY", raising=False)
+
+    assert callable(vercel_entry.app)
+    assert callable(vercel_entry.application)
+
+    # 1. GET / -> HTML SPA
+    statuses = []
+    headers_list = []
+
+    def start_response(status, headers):
+        statuses.append(status)
+        headers_list.append(headers)
+
+    body_chunks = vercel_entry.app(
+        {"REQUEST_METHOD": "GET", "PATH_INFO": "/"},
+        start_response,
+    )
+    html_str = b"".join(body_chunks).decode("utf-8")
+    assert statuses[-1] == "200 OK"
+    assert "BuscaLeads" in html_str
+    assert "Google Places API (New)" in html_str
+
+    # 2. GET /api/state -> JSON
+    state_chunks = vercel_entry.app(
+        {"REQUEST_METHOD": "GET", "PATH_INFO": "/api/state"},
+        start_response,
+    )
+    state_data = json.loads(b"".join(state_chunks).decode("utf-8"))
+    assert statuses[-1] == "200 OK"
+    assert "stats" in state_data
+    assert "catalog" in state_data
+    assert "api_usage" in state_data
+
+    # 3. POST /api/routes/generate without key -> 400 Bad Request with honest error
+    payload_bytes = json.dumps(
+        {
+            "provider_id": "google_places",
+            "start_lat": 36.7213,
+            "start_lon": -4.4214,
+            "start_label": "Centro Histórico",
+            "radius_m": 500,
+            "requested_stops": 10,
+            "categories": ["Restauración"],
+        }
+    ).encode("utf-8")
+    err_chunks = vercel_entry.app(
+        {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/api/routes/generate",
+            "CONTENT_LENGTH": str(len(payload_bytes)),
+            "wsgi.input": io.BytesIO(payload_bytes),
+        },
+        start_response,
+    )
+    err_data = json.loads(b"".join(err_chunks).decode("utf-8"))
+    assert statuses[-1] == "400 Bad Request"
+    assert err_data["ok"] is False
+    assert "GOOGLE_MAPS_API_KEY" in err_data["error"]
+
+
+

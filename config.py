@@ -15,12 +15,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --------------------------------------------------------------------------
-# Rutas
+# Rutas (con soporte automático para sistema de archivos efímero /tmp en Vercel)
 # --------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE_PATH = os.getenv("DATABASE_PATH", str(BASE_DIR / "facenia_leads.db"))
-BACKUPS_DIR = BASE_DIR / "backups"
-BACKUPS_DIR.mkdir(exist_ok=True)
+IS_VERCEL = bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV"))
+RUNTIME_DATA_DIR = Path("/tmp") if IS_VERCEL else BASE_DIR
+DATABASE_PATH = os.getenv("DATABASE_PATH", str(RUNTIME_DATA_DIR / "facenia_leads.db"))
+BACKUPS_DIR = RUNTIME_DATA_DIR / "backups"
+try:
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    BACKUPS_DIR = Path("/tmp/backups")
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
 WEB_DIR = BASE_DIR / "web"
 
 # --------------------------------------------------------------------------

@@ -6,12 +6,12 @@ codificados en UTF-8 con BOM para importación directa en Notion sin corrupción
 Sin emojis ni adornos visuales superfluos.
 """
 
+import csv
 import io
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-import pandas as pd
 
 from config import (
     FOLLOWUP_STATUSES,
@@ -54,30 +54,31 @@ COLUMN_EXPORT_MAPPING = [
 ]
 
 
-def prepare_export_dataframe(leads: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Convierte una lista de prospectos en un DataFrame estructurado y limpio."""
+def prepare_export_rows(leads: List[Dict[str, Any]]) -> Tuple[List[str], List[List[Any]]]:
+    """Convierte una lista de prospectos en cabeceras y filas estructuradas."""
+    headers = [col_label for _, col_label in COLUMN_EXPORT_MAPPING]
     if not leads:
-        return pd.DataFrame(columns=[col_label for _, col_label in COLUMN_EXPORT_MAPPING])
+        return headers, []
 
-    records = []
+    rows: List[List[Any]] = []
     for lead in leads:
-        row = {}
+        row: List[Any] = []
         web_val = lead.get("web_effective") or lead.get("web_status") or WEB_NONE
         prio_val = lead.get("priority_effective") or lead.get("priority") or "Baja"
         map_url = lead.get("map_url") or lead.get("google_maps_url") or ""
 
-        for key, label in COLUMN_EXPORT_MAPPING:
+        for key, _ in COLUMN_EXPORT_MAPPING:
             if key == "web_status_val":
-                row[label] = web_val
+                row.append(web_val)
             elif key == "priority_val":
-                row[label] = prio_val
+                row.append(prio_val)
             elif key == "map_url":
-                row[label] = map_url
+                row.append(map_url)
             else:
-                row[label] = lead.get(key, "")
-        records.append(row)
+                row.append(lead.get(key, ""))
+        rows.append(row)
 
-    return pd.DataFrame(records)
+    return headers, rows
 
 
 def export_leads_to_csv_bytes(leads: List[Dict[str, Any]]) -> bytes:
@@ -85,9 +86,12 @@ def export_leads_to_csv_bytes(leads: List[Dict[str, Any]]) -> bytes:
     Genera un archivo CSV codificado en UTF-8 con BOM ('utf-8-sig').
     Garantiza compatibilidad nativa con Notion, CRM y Microsoft Excel.
     """
-    df = prepare_export_dataframe(leads)
+    headers, rows = prepare_export_rows(leads)
     output = io.StringIO()
-    df.to_csv(output, index=False, encoding="utf-8-sig")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(row)
     return output.getvalue().encode("utf-8-sig")
 
 
@@ -143,7 +147,7 @@ def export_leads_to_excel_bytes(all_leads: List[Dict[str, Any]]) -> bytes:
     ws_all = wb.active
     ws_all.title = "Todos los Prospectos"
 
-    df_all = prepare_export_dataframe(all_leads)
+    df_all = prepare_export_rows(all_leads)
 
     # Filtrar sin web
     no_web_leads = [
@@ -152,34 +156,35 @@ def export_leads_to_excel_bytes(all_leads: List[Dict[str, Any]]) -> bytes:
             WEB_NONE, WEB_SOCIAL, WEB_CONFIRMED_NONE, "Sin web indicada", "Solo redes sociales"
         )
     ]
-    df_no_web = prepare_export_dataframe(no_web_leads)
+    df_no_web = prepare_export_rows(no_web_leads)
 
     # Filtrar prioridad alta
     high_priority_leads = [
         item for item in all_leads
         if (item.get("priority_effective") or item.get("priority")) == PRIORITY_HIGH
     ]
-    df_high = prepare_export_dataframe(high_priority_leads)
+    df_high = prepare_export_rows(high_priority_leads)
 
     # Filtrar pendientes de verificar
     pending_leads = [
         item for item in all_leads
         if (item.get("web_effective") or item.get("web_status")) in (WEB_REVIEW, "Revisión manual", "Pendiente de verificar")
     ]
-    df_pending = prepare_export_dataframe(pending_leads)
+    df_pending = prepare_export_rows(pending_leads)
 
     # Filtrar seguimiento comercial
     followup_leads = [
         item for item in all_leads
         if item.get("commercial_status") in FOLLOWUP_STATUSES or item.get("next_followup_date")
     ]
-    df_followup = prepare_export_dataframe(followup_leads)
+    df_followup = prepare_export_rows(followup_leads)
 
-    def populate_sheet(ws, df, sheet_name):
+    def populate_sheet(ws, table_data, sheet_name):
+        headers, rows = table_data
         ws.title = sheet_name
-        ws.append(list(df.columns))
-        for row in df.itertuples(index=False):
-            ws.append(list(row))
+        ws.append(headers)
+        for row in rows:
+            ws.append(row)
         _apply_sheet_formatting(ws, sheet_name)
 
     populate_sheet(ws_all, df_all, "Todos los Prospectos")
