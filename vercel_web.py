@@ -70,6 +70,7 @@ from routing_service import (
 )
 from search_service import generate_prospecting_route
 from verification import check_website
+from auth_service import authenticate, generate_session_token, verify_session_token
 
 MALAGA_ZONE_PRESETS = [
     {"label": "Málaga centro (Plaza de la Constitución)", "lat": 36.7213, "lon": -4.4214},
@@ -213,6 +214,22 @@ def _json_response(
     return [body]
 
 
+def _extract_auth_token(environ: Dict[str, Any]) -> str:
+    auth_header = environ.get("HTTP_AUTHORIZATION") or ""
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    x_token = environ.get("HTTP_X_AUTH_TOKEN") or ""
+    if x_token:
+        return x_token.strip()
+    cookie_str = environ.get("HTTP_COOKIE") or ""
+    if "facenia_auth_token=" in cookie_str:
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if part.startswith("facenia_auth_token="):
+                return part.split("=", 1)[1].strip()
+    return ""
+
+
 def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
     """Punto de entrada WSGI estándar para Vercel (`@vercel/python`) y servidores HTTP."""
     init_db(DATABASE_PATH)
@@ -246,6 +263,66 @@ def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
                 ],
             )
             return [body]
+
+        if method == "POST" and path == "/api/auth/login":
+            data = _read_json_body(environ)
+            username = (data.get("username") or "").strip()
+            password = (data.get("password") or "").strip()
+            ok, user_info, err = authenticate(username, password, DATABASE_PATH)
+            if not ok:
+                return _json_response(
+                    start_response,
+                    {"ok": False, "error": err or "Usuario o contraseña incorrectos."},
+                    "401 Unauthorized",
+                )
+            token = generate_session_token(username)
+            cookie_header = (
+                "Set-Cookie",
+                f"facenia_auth_token={token}; Path=/; SameSite=Lax; Max-Age={86400 * 14}",
+            )
+            body = json.dumps({"ok": True, "token": token, "user": user_info}, ensure_ascii=False).encode("utf-8")
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", "no-store"),
+                    cookie_header,
+                ],
+            )
+            return [body]
+
+        if method == "GET" and path == "/api/auth/status":
+            token = _extract_auth_token(environ)
+            user = verify_session_token(token)
+            if user:
+                return _json_response(start_response, {"ok": True, "authenticated": True, "user": {"username": user}})
+            return _json_response(start_response, {"ok": True, "authenticated": False, "user": None})
+
+        if method == "POST" and path == "/api/auth/logout":
+            cookie_header = ("Set-Cookie", "facenia_auth_token=; Path=/; SameSite=Lax; Max-Age=0")
+            body = json.dumps({"ok": True, "authenticated": False}, ensure_ascii=False).encode("utf-8")
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "application/json; charset=utf-8"),
+                    ("Content-Length", str(len(body))),
+                    ("Cache-Control", "no-store"),
+                    cookie_header,
+                ],
+            )
+            return [body]
+
+        # Comprobación de seguridad para endpoints privados
+        if path.startswith("/api/") or path.startswith("/export/"):
+            token = _extract_auth_token(environ)
+            auth_user = verify_session_token(token)
+            if not auth_user:
+                return _json_response(
+                    start_response,
+                    {"ok": False, "error": "Acceso restringido. Por favor, inicia sesión con tus credenciales."},
+                    "401 Unauthorized",
+                )
 
         if method == "GET" and path == "/api/state":
             return _json_response(start_response, _build_full_state())
@@ -1042,7 +1119,7 @@ def _RENDER_SPA_HTML() -> str:
     <div id="app-content">Cargando BuscaLeads · FACENIA...</div>
   </div>
 
-  <nav class="bottom-nav" aria-label="Navegación principal">
+  <nav id="main-bottom-nav" class="bottom-nav" aria-label="Navegación principal">
     <button class="nav-item active" data-tab="inicio" onclick="switchTab('inicio')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 10.5 12 3l9 7.5V21a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1v-10.5Z"/></svg>
       <span>Inicio</span>
@@ -1128,8 +1205,121 @@ def _RENDER_SPA_HTML() -> str:
       tick();
     }
 
+    let AUTH_STATE = {
+      authenticated: false,
+      user: null,
+      loading: true
+    };
+    let LOGIN_FORM = {
+      username: 'admin123',
+      password: '',
+      loading: false,
+      error: ''
+    };
+
+    async function apiFetch(url, options = {}) {
+      const token = localStorage.getItem('facenia_auth_token') || '';
+      const headers = Object.assign({}, options.headers || {}, {
+        'Authorization': 'Bearer ' + token,
+        'X-Auth-Token': token
+      });
+      const res = await fetch(url, Object.assign({}, options, { headers }));
+      if (res.status === 401 && !url.includes('/api/auth/login')) {
+        localStorage.removeItem('facenia_auth_token');
+        AUTH_STATE.authenticated = false;
+        AUTH_STATE.user = null;
+        render();
+      }
+      return res;
+    }
+
+    async function checkAuthOnLoad() {
+      const token = localStorage.getItem('facenia_auth_token');
+      if (!token) {
+        AUTH_STATE.authenticated = false;
+        AUTH_STATE.loading = false;
+        render();
+        return;
+      }
+      try {
+        const res = await apiFetch('/api/auth/status');
+        const data = await res.json();
+        if (data && data.authenticated) {
+          AUTH_STATE.authenticated = true;
+          AUTH_STATE.user = data.user;
+          await loadState();
+        } else {
+          AUTH_STATE.authenticated = false;
+          AUTH_STATE.user = null;
+          localStorage.removeItem('facenia_auth_token');
+        }
+      } catch (e) {
+        AUTH_STATE.authenticated = false;
+      } finally {
+        AUTH_STATE.loading = false;
+        render();
+      }
+    }
+
+    async function handleLogin() {
+      const uInput = document.getElementById('login-username');
+      const pInput = document.getElementById('login-password');
+      const username = (uInput ? uInput.value : LOGIN_FORM.username).trim();
+      const password = (pInput ? pInput.value : LOGIN_FORM.password).trim();
+      LOGIN_FORM.username = username;
+      LOGIN_FORM.password = password;
+
+      if (!username || !password) {
+        LOGIN_FORM.error = 'Introduce usuario y contraseña.';
+        render();
+        return;
+      }
+
+      LOGIN_FORM.loading = true;
+      LOGIN_FORM.error = '';
+      render();
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          localStorage.setItem('facenia_auth_token', data.token);
+          AUTH_STATE.authenticated = true;
+          AUTH_STATE.user = data.user;
+          LOGIN_FORM.error = '';
+          LOGIN_FORM.password = '';
+          await loadState();
+          showToast('Bienvenido, ' + data.user.username);
+        } else {
+          LOGIN_FORM.error = data.error || 'Usuario o contraseña incorrectos.';
+        }
+      } catch (err) {
+        LOGIN_FORM.error = 'Error de conexión con el servidor.';
+      } finally {
+        LOGIN_FORM.loading = false;
+        render();
+      }
+    }
+
+    async function handleLogout() {
+      try {
+        await apiFetch('/api/auth/logout', { method: 'POST' });
+      } catch (e) {}
+      localStorage.removeItem('facenia_auth_token');
+      AUTH_STATE.authenticated = false;
+      AUTH_STATE.user = null;
+      STATE = null;
+      render();
+      showToast('Sesión cerrada correctamente');
+    }
+
     async function loadState() {
-      const res = await fetch('/api/state');
+      const res = await apiFetch('/api/state');
+      if (!res.ok) return;
       STATE = await res.json();
       if (STATE && STATE.settings) {
         ROUTE_FORM.provider_id = STATE.google_Configured ? (STATE.settings.default_provider || 'google_places') : 'osm';
@@ -1177,10 +1367,78 @@ def _RENDER_SPA_HTML() -> str:
       return Boolean(x.last_visit_at) || !['Nuevo', 'Pendiente', 'Pendiente de revisar', 'Pendiente de contactar', 'Pendiente de visitar'].includes(x.commercial_status || 'Nuevo');
     }
 
+    function renderLogin() {
+      return `
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:82vh;padding:20px 8px;">
+          <div style="width:64px;height:64px;border-radius:20px;background:var(--gold-bg);border:1.5px solid rgba(226,179,37,0.4);display:flex;align-items:center;justify-content:center;margin-bottom:16px;box-shadow:0 8px 24px rgba(226,179,37,0.15);">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#E2B325" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <div style="font-size:11px;font-weight:800;color:var(--gold);letter-spacing:0.12em;text-transform:uppercase;">FACENIA · ACCESO EXCLUSIVO</div>
+          <h1 style="font-size:26px;font-weight:800;margin:6px 0 6px;text-align:center;letter-spacing:-0.02em;">BuscaLeads</h1>
+          <p style="font-size:13px;color:var(--muted);text-align:center;margin:0 0 24px;max-width:300px;line-height:1.45;">
+            Sistema de prospección comercial local y optimización de rutas a pie.
+          </p>
+
+          <div class="card" style="width:100%;max-width:380px;padding:22px;border:1px solid rgba(255,255,255,0.12);background:var(--surface);">
+            <form onsubmit="event.preventDefault();handleLogin();" style="margin:0;">
+              ${LOGIN_FORM.error ? `
+                <div style="background:#3b1219;border:1px solid #EF4444;color:#FCA5A5;padding:10px 14px;border-radius:10px;font-size:12px;margin-bottom:16px;font-weight:600;display:flex;align-items:center;gap:8px;">
+                  <span>⚠️</span>
+                  <span>${escapeHtml(LOGIN_FORM.error)}</span>
+                </div>
+              ` : ''}
+
+              <div style="margin-bottom:16px;">
+                <label for="login-username" style="display:block;font-size:12px;color:var(--muted);font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em;">Usuario</label>
+                <input id="login-username" name="username" type="text" class="input-text" value="${escapeHtml(LOGIN_FORM.username)}" placeholder="admin123" autocomplete="username" required />
+              </div>
+
+              <div style="margin-bottom:22px;">
+                <label for="login-password" style="display:block;font-size:12px;color:var(--muted);font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em;">Contraseña</label>
+                <input id="login-password" name="password" type="password" class="input-text" placeholder="••••••••" autocomplete="current-password" required />
+              </div>
+
+              <button id="login-btn" type="submit" class="btn-gold-cta" style="width:100%;height:48px;font-size:15px;display:flex;align-items:center;justify-content:center;gap:8px;" ${LOGIN_FORM.loading ? 'disabled' : ''}>
+                ${LOGIN_FORM.loading ? 'Verificando credenciales...' : 'Entrar al sistema →'}
+              </button>
+            </form>
+          </div>
+
+          <div style="margin-top:20px;padding:12px 18px;border-radius:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);max-width:360px;text-align:center;">
+            <div style="font-size:12px;font-weight:700;color:#FFFFFF;margin-bottom:3px;display:flex;align-items:center;justify-content:center;gap:6px;">
+              <span>🔒</span> <span>Acceso Protegido</span>
+            </div>
+            <div style="font-size:11px;color:var(--muted);line-height:1.45;">
+              Las altas y bajas de cuentas se gestionan exclusivamente desde la base de datos de FACENIA.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     function render() {
       const root = document.getElementById('app-content');
+      const bottomNav = document.getElementById('main-bottom-nav');
+
+      if (AUTH_STATE.loading) {
+        if (bottomNav) bottomNav.style.display = 'none';
+        root.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:70vh;color:var(--muted);"><div style="font-size:32px;margin-bottom:12px;">⏳</div><div>Cargando BuscaLeads...</div></div>';
+        return;
+      }
+
+      if (!AUTH_STATE.authenticated) {
+        if (bottomNav) bottomNav.style.display = 'none';
+        root.innerHTML = renderLogin();
+        return;
+      }
+
+      if (bottomNav) bottomNav.style.display = 'flex';
+
       if (!STATE) {
-        root.innerHTML = '<div class="card">Cargando BuscaLeads...</div>';
+        root.innerHTML = '<div class="card">Cargando datos de BuscaLeads...</div>';
         return;
       }
       if (SUBSCREEN === 'crear_ruta') {
@@ -1234,7 +1492,10 @@ def _RENDER_SPA_HTML() -> str:
             <div style="font-size:11px;font-weight:800;color:var(--gold);letter-spacing:0.08em;">FACENIA · PROSPECCIÓN</div>
             <h1 class="screen-title">BuscaLeads</h1>
           </div>
-          <span class="mint-pill">${STATE.supabase_configured ? '✓ Supabase activo' : 'SQLite local'}</span>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span class="mint-pill">${STATE.supabase_configured ? '✓ Supabase activo' : 'SQLite local'}</span>
+            <button class="circle-btn" onclick="handleLogout()" title="Cerrar sesión (${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'admin123')})" style="width:34px;height:34px;font-size:13px;color:var(--muted);background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);">⎋</button>
+          </div>
         </div>
 
         <button class="btn-gold-cta" onclick="openCreateRoute()">
@@ -1772,7 +2033,7 @@ def _RENDER_SPA_HTML() -> str:
       const routeId = STATE.active_route ? STATE.active_route.id : null;
       const notesEl = document.getElementById('ficha-notes');
       const note = notesEl ? notesEl.value : '';
-      const res = await fetch('/api/leads/visit', {
+      const res = await apiFetch('/api/leads/visit', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ lead_id: leadId, outcome, route_id: routeId, note })
@@ -1794,7 +2055,7 @@ def _RENDER_SPA_HTML() -> str:
     async function saveFichaNotes(leadId) {
       const lead = findLeadById(leadId) || {};
       const notes = document.getElementById('ficha-notes').value;
-      const res = await fetch('/api/leads/update', {
+      const res = await apiFetch('/api/leads/update', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -1857,6 +2118,17 @@ def _RENDER_SPA_HTML() -> str:
       return `
         <div class="top-nav-row">
           <h1 class="screen-title">Perfil y Ajustes</h1>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Sesión activa</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;">
+            <div>
+              <div style="font-size:15px;font-weight:700;color:#FFF;">${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'admin123')}</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:2px;">Rol: Administrador · Base de datos</div>
+            </div>
+            <button class="btn-white-pill" onclick="handleLogout()" style="color:#F87171;border-color:rgba(239,68,68,0.3);padding:8px 14px;font-size:12px;">Cerrar sesión</button>
+          </div>
         </div>
 
         <div class="card">
@@ -1938,7 +2210,7 @@ def _RENDER_SPA_HTML() -> str:
       const inp = document.getElementById('geo-input');
       const q = inp ? inp.value.trim() : '';
       if (!q) return;
-      const res = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      const res = await apiFetch('/api/geocode?q=' + encodeURIComponent(q));
       const data = await res.json();
       if (!res.ok || data.error) {
         showToast(data.error || 'Dirección no encontrada');
@@ -1955,7 +2227,7 @@ def _RENDER_SPA_HTML() -> str:
       ROUTE_FORM.error_msg = '';
       render();
       try {
-        const res = await fetch('/api/routes/generate', {
+        const res = await apiFetch('/api/routes/generate', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify(ROUTE_FORM)
@@ -1979,7 +2251,7 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     async function stepRoute(routeId, nextIndex) {
-      const res = await fetch('/api/routes/select', {
+      const res = await apiFetch('/api/routes/select', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ route_id: routeId, current_index: nextIndex })
@@ -1990,7 +2262,7 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     async function undoLastVisit() {
-      const res = await fetch('/api/visits/undo', { method: 'POST' });
+      const res = await apiFetch('/api/visits/undo', { method: 'POST' });
       const data = await res.json();
       if (data.state) STATE = data.state;
       showToast('Último registro deshecho');
@@ -1998,7 +2270,7 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     async function fetchPlaceDetails(leadId) {
-      const res = await fetch('/api/leads/place-details', {
+      const res = await apiFetch('/api/leads/place-details', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ lead_id: leadId })
@@ -2020,7 +2292,7 @@ def _RENDER_SPA_HTML() -> str:
         places_max_results: Number(document.getElementById('cfg-max-res').value || 20),
         places_max_requests: Number(document.getElementById('cfg-max-req').value || 3)
       };
-      const res = await fetch('/api/settings', {
+      const res = await apiFetch('/api/settings', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload)
@@ -2033,7 +2305,7 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     async function resetApiCounter() {
-      const res = await fetch('/api/settings', {
+      const res = await apiFetch('/api/settings', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ action: 'reset_counter' })
@@ -2044,7 +2316,7 @@ def _RENDER_SPA_HTML() -> str:
       render();
     }
 
-    loadState();
+    checkAuthOnLoad();
   </script>
 </body>
 </html>"""

@@ -392,6 +392,48 @@ if saved_default_provider not in ("google_places", "osm"):
 saved_max_results = int(get_setting("places_max_results", str(PLACES_MAX_RESULTS_PER_SEARCH)) or PLACES_MAX_RESULTS_PER_SEARCH)
 saved_max_requests = int(get_setting("places_max_requests", str(PLACES_MAX_REQUESTS_PER_SEARCH)) or PLACES_MAX_REQUESTS_PER_SEARCH)
 
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+
+if not st.session_state.authenticated:
+    st.markdown(
+        """
+        <div style="text-align: center; margin-top: 1.5rem; margin-bottom: 1.5rem;">
+            <div style="display:inline-block; padding: 14px 18px; background: rgba(226, 179, 37, 0.15); border-radius: 20px; border: 1.5px solid rgba(226, 179, 37, 0.4);">
+                <span style="font-size: 28px;">🔒</span>
+            </div>
+            <div style="font-size: 11px; font-weight: 800; color: #E2B325; letter-spacing: 0.12em; text-transform: uppercase; margin-top: 12px;">FACENIA · ACCESO EXCLUSIVO</div>
+            <h1 style="margin: 4px 0 6px 0; font-size: 26px; font-weight: 800;">BuscaLeads</h1>
+            <p style="color: #9CA3AF; font-size: 13px; margin: 0 auto; max-width: 320px;">Introduce tus credenciales para acceder al sistema.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form", clear_on_submit=False):
+        u = st.text_input("Usuario", value="admin123", key="login_username_input")
+        p = st.text_input("Contraseña", type="password", key="login_password_input")
+        submitted = st.form_submit_button("Iniciar sesión →", use_container_width=True, type="primary")
+        if submitted:
+            from auth_service import authenticate
+            ok, user_info, err = authenticate(u, p, DATABASE_PATH)
+            if ok:
+                st.session_state.authenticated = True
+                st.session_state.auth_user = user_info
+                st.rerun()
+            else:
+                st.error(err or "Usuario o contraseña incorrectos.")
+    st.markdown(
+        """
+        <div style="text-align: center; margin-top: 1.5rem; font-size: 11px; color: #9CA3AF;">
+            🔒 <strong>Acceso protegido</strong> · Las altas y bajas se gestionan exclusivamente desde la base de datos de FACENIA.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
 if "nav_tab" not in st.session_state:
     st.session_state.nav_tab = "inicio"
 if "sub_screen" not in st.session_state:
@@ -1847,6 +1889,17 @@ elif st.session_state.nav_tab == "perfil":
         </div>
         """
     )
+
+    # 0. Sesión activa
+    with st.container(border=True):
+        st.markdown("**:material/account_circle: Sesión activa**")
+        user_name = (st.session_state.auth_user or {}).get("username", "admin123")
+        u_col1, u_col2 = st.columns([2, 1])
+        u_col1.caption(f"Usuario autenticado: **{user_name}** · Rol: **Administrador** (Base de datos)")
+        if u_col2.button("Cerrar sesión", icon=":material/logout:", key="btn_logout_user", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.auth_user = None
+            st.rerun()
 
     # 1. Preferencias de búsqueda por defecto
     with st.container(border=True):

@@ -202,6 +202,26 @@ def init_db(db_path: Optional[str] = None) -> None:
         note TEXT DEFAULT '', followup_date TEXT DEFAULT '', sale_service TEXT DEFAULT '',
         sale_amount REAL, discard_reason TEXT DEFAULT '', snapshot_json TEXT,
         undone INTEGER DEFAULT 0, undone_at TEXT DEFAULT '')""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'admin',
+        created_at TEXT NOT NULL,
+        last_login TEXT)""")
+
+    # Usuario inicial administrador obligatorio
+    cur.execute("SELECT id FROM users WHERE LOWER(username) = 'admin123'")
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (
+                "admin123",
+                "pbkdf2_sha256$262d6afff4871dd2624ec8cfc5136c12$de94e23bc99aba936ebf08a5155a3ce3cb4dd06c662bbdde58358a55bf3c9295",
+                "admin",
+                _now(),
+            ),
+        )
 
     if current_version < SCHEMA_VERSION:
         _migrate_data(cur)
@@ -212,6 +232,7 @@ def init_db(db_path: Optional[str] = None) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_results_search ON search_results(search_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_stops_route ON route_stops(route_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inter_lead ON interactions(lead_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
     cur.execute("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('schema_version', ?, ?)",
                 (str(SCHEMA_VERSION), _now()))

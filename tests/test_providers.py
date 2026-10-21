@@ -387,9 +387,38 @@ def test_vercel_wsgi_entrypoint_and_api(tmp_path, monkeypatch):
     assert statuses[-1] == "200 OK"
     assert "BuscaLeads" in b"".join(vercel_root_chunks).decode("utf-8")
 
-    # 2. GET /api/state (both direct and via Vercel __path rewrite) -> JSON
-    state_chunks = vercel_entry.app(
+    # 2. GET /api/state sin autenticación -> 401 Unauthorized
+    unauth_chunks = vercel_entry.app(
         {"REQUEST_METHOD": "GET", "PATH_INFO": "/app.py", "QUERY_STRING": "__path=/api/state"},
+        start_response,
+    )
+    assert statuses[-1] == "401 Unauthorized"
+
+    # 2b. POST /api/auth/login con admin123 / admin123 -> 200 OK con token
+    login_body = json.dumps({"username": "admin123", "password": "admin123"}).encode("utf-8")
+    login_chunks = vercel_entry.app(
+        {
+            "REQUEST_METHOD": "POST",
+            "PATH_INFO": "/api/auth/login",
+            "CONTENT_LENGTH": str(len(login_body)),
+            "wsgi.input": io.BytesIO(login_body),
+        },
+        start_response,
+    )
+    assert statuses[-1] == "200 OK"
+    login_data = json.loads(b"".join(login_chunks).decode("utf-8"))
+    assert login_data["ok"] is True
+    auth_token = login_data["token"]
+    assert bool(auth_token)
+
+    # 2c. GET /api/state con token de autorización -> 200 OK con datos completos
+    state_chunks = vercel_entry.app(
+        {
+            "REQUEST_METHOD": "GET",
+            "PATH_INFO": "/app.py",
+            "QUERY_STRING": "__path=/api/state",
+            "HTTP_AUTHORIZATION": f"Bearer {auth_token}",
+        },
         start_response,
     )
     state_data = json.loads(b"".join(state_chunks).decode("utf-8"))
@@ -398,7 +427,7 @@ def test_vercel_wsgi_entrypoint_and_api(tmp_path, monkeypatch):
     assert "catalog" in state_data
     assert "api_usage" in state_data
 
-    # 3. POST /api/routes/generate without key -> 400 Bad Request with honest error
+    # 3. POST /api/routes/generate con token pero sin key de Google -> 400 Bad Request
     payload_bytes = json.dumps(
         {
             "provider_id": "google_places",
@@ -415,6 +444,7 @@ def test_vercel_wsgi_entrypoint_and_api(tmp_path, monkeypatch):
             "REQUEST_METHOD": "POST",
             "PATH_INFO": "/api/routes/generate",
             "CONTENT_LENGTH": str(len(payload_bytes)),
+            "HTTP_AUTHORIZATION": f"Bearer {auth_token}",
             "wsgi.input": io.BytesIO(payload_bytes),
         },
         start_response,
