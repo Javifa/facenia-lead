@@ -26,6 +26,7 @@ from config import (BACKUPS_DIR, DATABASE_PATH, DEFAULT_COMMERCIAL_STATUS,
 from scoring import calculate_lead_score
 from supabase_sync import (
     hydrate_or_push_initial_state,
+    sync_delete_all_leads_to_supabase,
     sync_delete_lead_to_supabase,
     sync_interaction_to_supabase,
     sync_lead_to_supabase,
@@ -557,6 +558,20 @@ def delete_lead(lead_id: int, db_path: Optional[str] = None) -> bool:
     if ok:
         sync_delete_lead_to_supabase(lead_id, db_path=db_path)
     return ok
+
+
+def delete_all_leads(db_path: Optional[str] = None) -> int:
+    """Elimina todos los prospectos reales de la base de datos y sus paradas en rutas."""
+    conn = _connect(db_path)
+    cur = conn.execute("DELETE FROM leads WHERE is_demo=0")
+    deleted = cur.rowcount
+    conn.execute("DELETE FROM route_stops")
+    conn.commit()
+    conn.close()
+    set_setting("active_route_id", "", db_path=db_path)
+    if deleted > 0:
+        sync_delete_all_leads_to_supabase(db_path=db_path)
+    return deleted
 
 
 def remove_route_stop(route_id: int, lead_id: int, db_path: Optional[str] = None) -> bool:

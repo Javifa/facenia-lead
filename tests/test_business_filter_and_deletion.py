@@ -1,6 +1,6 @@
 import pytest
 from business_filter import is_large_business_or_chain
-from database import init_db, save_lead, get_lead, delete_lead
+from database import init_db, save_lead, get_lead, delete_lead, delete_all_leads, get_leads
 
 def test_is_large_business_or_chain():
     # Large chains / franchises
@@ -79,3 +79,17 @@ def test_delete_lead_database(tmp_path, monkeypatch):
     deleted = delete_lead(lead_id, db_path=test_db)
     assert deleted is True
     assert get_lead(lead_id, db_path=test_db) is None
+
+
+def test_delete_all_leads_database(tmp_path, monkeypatch):
+    test_db = str(tmp_path / "test_leads.db")
+    monkeypatch.setattr("database.DATABASE_PATH", test_db)
+    init_db(test_db)
+
+    save_lead({"name": "Local 1", "sector": "hosteleria", "lat": 36.72, "lon": -4.42}, db_path=test_db)
+    save_lead({"name": "Local 2", "sector": "comercios", "lat": 36.73, "lon": -4.43}, db_path=test_db)
+    assert len(get_leads(db_path=test_db)) >= 2
+
+    count = delete_all_leads(db_path=test_db)
+    assert count >= 2
+    assert len(get_leads(db_path=test_db)) == 0

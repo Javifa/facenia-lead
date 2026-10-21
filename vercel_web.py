@@ -9,7 +9,7 @@ compatible con `@vercel/python`.
 from datetime import date, timedelta
 import json
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote_plus
 
 from config import (
     COMMERCIAL_STATUSES,
@@ -35,6 +35,7 @@ from config import (
     is_supabase_configured,
 )
 from database import (
+    delete_all_leads,
     delete_lead,
     get_api_usage_stats,
     get_lead,
@@ -48,6 +49,7 @@ from database import (
     record_visit_outcome,
     remove_route_stop,
     reset_api_usage_stats,
+    save_lead,
     set_manual_web_status,
     set_setting,
     undo_interaction,
@@ -57,13 +59,14 @@ from database import (
 )
 from export_service import export_leads_to_csv_bytes, export_leads_to_excel_bytes
 from pitch_service import (
+    GOOGLE_PLACE_ID_RE,
     NFC_STATUS_OPTIONS,
     REVIEW_URL_STATUS_OPTIONS,
     generate_commercial_recommendation,
     generate_sales_pitch,
     prepare_review_link_info,
 )
-from places_client import PlacesAPIError
+from places_client import PlacesAPIError, PlacesClient
 from providers import GooglePlacesProvider, OSMOverpassProvider
 from routing_service import (
     build_google_maps_directions_to_lead,
@@ -82,6 +85,124 @@ MALAGA_ZONE_PRESETS = [
     {"label": "El Palo / Pedregalejo", "lat": 36.7214, "lon": -4.3608},
     {"label": "Ciudad Jardín", "lat": 36.7438, "lon": -4.4225},
 ]
+
+
+def _search_places_for_reviews(query: str, db_path: str = DATABASE_PATH) -> List[Dict[str, Any]]:
+    """Busca cualquier negocio por nombre o texto y genera su enlace oficial de reseñas Google."""
+    clean_q = (query or "").strip()
+    if not clean_q:
+        return []
+
+    # 1. Place ID directo de Google (ej. ChIJ...)
+    if GOOGLE_PLACE_ID_RE.match(clean_q):
+        direct_url = f"https://search.google.com/local/writereview?placeid={clean_q}"
+        return [{
+            "place_id": clean_q,
+            "name": f"Local con Place ID: {clean_q}",
+            "address": "Identificador oficial de Google Places",
+            "lat": None,
+            "lon": None,
+            "rating": None,
+            "user_ratings_total": None,
+            "review_url": direct_url,
+            "is_direct": True,
+            "gmaps_url": f"https://www.google.com/maps/place/?q=place_id:{clean_q}",
+        }]
+
+    # 2. URL pegada por el usuario
+    if clean_q.lower().startswith(("http://", "https://")):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(clean_q)
+        qs = urllib.parse.parse_qs(parsed.query)
+        extracted_pid = ""
+        for param in ("placeid", "place_id"):
+            if param in qs and qs[param]:
+                extracted_pid = qs[param][0]
+                break
+        if extracted_pid and GOOGLE_PLACE_ID_RE.match(extracted_pid):
+            direct_url = f"https://search.google.com/local/writereview?placeid={extracted_pid}"
+            return [{
+                "place_id": extracted_pid,
+                "name": "Local extraído de enlace",
+                "address": "Enlace oficial con Place ID",
+                "lat": None,
+                "lon": None,
+                "rating": None,
+                "user_ratings_total": None,
+                "review_url": direct_url,
+                "is_direct": True,
+                "gmaps_url": clean_q,
+            }]
+        return [{
+            "place_id": "",
+            "name": "Enlace personalizado introducido",
+            "address": clean_q,
+            "lat": None,
+            "lon": None,
+            "rating": None,
+            "user_ratings_total": None,
+            "review_url": clean_q,
+            "is_direct": True,
+            "gmaps_url": clean_q,
+        }]
+
+    # 3. Búsqueda con Google Places API (New)
+    try:
+        client = PlacesClient(db_path=db_path)
+        if client.api_key:
+            res = client.search_places_text(
+                query=clean_q,
+                max_results=6,
+                field_mask="places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.googleMapsUri,places.location",
+            )
+            raw_places = res.get("places", [])
+            results = []
+            for p in raw_places:
+                pid = p.get("id") or ""
+                name = (p.get("displayName") or {}).get("text") or clean_q
+                addr = p.get("formattedAddress") or ""
+                loc = p.get("location") or {}
+                lat = loc.get("latitude")
+                lon = loc.get("longitude")
+                rating = p.get("rating")
+                rcount = p.get("userRatingCount")
+                if pid:
+                    direct_url = f"https://search.google.com/local/writereview?placeid={pid}"
+                    is_dir = True
+                else:
+                    direct_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(name + ' ' + addr)}"
+                    is_dir = False
+                results.append({
+                    "place_id": pid,
+                    "name": name,
+                    "address": addr,
+                    "lat": lat,
+                    "lon": lon,
+                    "rating": rating,
+                    "user_ratings_total": rcount,
+                    "review_url": direct_url,
+                    "is_direct": is_dir,
+                    "gmaps_url": p.get("googleMapsUri") or f"https://www.google.com/maps/search/?api=1&query={quote_plus(name + ' ' + addr)}",
+                })
+            if results:
+                return results
+    except Exception:
+        pass
+
+    # 4. Fallback si no hay API de Google Places o si la búsqueda no dio resultados
+    fallback_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(clean_q)}"
+    return [{
+        "place_id": "",
+        "name": clean_q,
+        "address": "Búsqueda en Google Maps",
+        "lat": None,
+        "lon": None,
+        "rating": None,
+        "user_ratings_total": None,
+        "review_url": fallback_url,
+        "is_direct": False,
+        "gmaps_url": fallback_url,
+    }]
 
 
 def _enrich_lead_for_client(
@@ -550,6 +671,38 @@ def wsgi_app(environ: Dict[str, Any], start_response: Callable) -> List[bytes]:
                 return _json_response(start_response, {"ok": False, "error": "Datos incompletos"}, "400 Bad Request")
             ok = remove_route_stop(route_id, lead_id, db_path=DATABASE_PATH)
             return _json_response(start_response, {"ok": ok, "state": _build_full_state()})
+
+        if method == "POST" and path == "/api/leads/delete-all":
+            count = delete_all_leads(DATABASE_PATH)
+            return _json_response(start_response, {"ok": True, "deleted": count, "state": _build_full_state()})
+
+        if method == "POST" and path == "/api/reviews/search":
+            data = _read_json_body(environ)
+            q = (data.get("query") or "").strip()
+            results = _search_places_for_reviews(q, db_path=DATABASE_PATH)
+            return _json_response(start_response, {"ok": True, "results": results, "query": q})
+
+        if method == "POST" and path == "/api/leads/save-single":
+            data = _read_json_body(environ)
+            name = (data.get("name") or "").strip()
+            if not name:
+                return _json_response(start_response, {"ok": False, "error": "Nombre obligatorio"}, "400 Bad Request")
+            lead_data = {
+                "name": name,
+                "address": (data.get("address") or "").strip(),
+                "place_id": (data.get("place_id") or "").strip(),
+                "source_id": (data.get("place_id") or "").strip(),
+                "lat": data.get("lat"),
+                "lon": data.get("lon"),
+                "rating": data.get("rating"),
+                "user_ratings_total": data.get("user_ratings_total"),
+                "review_url": (data.get("review_url") or "").strip(),
+                "review_url_status": "Verificado (Place ID oficial)" if data.get("is_direct") else "Búsqueda pública (pendiente de fijar ficha)",
+                "data_source": "Google Places (Búsqueda directa)" if data.get("place_id") else "Búsqueda manual",
+                "sector": "hosteleria" if any(w in name.lower() for w in ("bar", "restaurante", "cafe", "cafeteria")) else "comercios",
+            }
+            lead_id, is_new = save_lead(lead_data, db_path=DATABASE_PATH)
+            return _json_response(start_response, {"ok": True, "lead_id": lead_id, "is_new": is_new, "state": _build_full_state()})
 
         if method == "POST" and path == "/api/settings":
             data = _read_json_body(environ)
@@ -1086,30 +1239,45 @@ def _RENDER_SPA_HTML() -> str:
       transform: translateX(-50%);
       width: 100%;
       max-width: 440px;
-      background: rgba(13, 13, 16, 0.96);
-      backdrop-filter: blur(14px);
-      border-top: 1px solid var(--border);
-      display: grid;
-      grid-template-columns: repeat(5, 1fr);
-      padding: 7px 4px calc(7px + env(safe-area-inset-bottom, 0px));
-      z-index: 999;
+      background: rgba(18, 18, 23, 0.98);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      border-left: 1px solid rgba(255, 255, 255, 0.06);
+      border-right: 1px solid rgba(255, 255, 255, 0.06);
+      display: flex !important;
+      justify-content: space-around;
+      align-items: stretch;
+      padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+      z-index: 1000;
+      box-sizing: border-box;
+      box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
     }
     .nav-item {
+      flex: 1 1 0;
+      width: 0;
+      min-width: 0;
       background: transparent;
       border: none;
       color: var(--muted);
       display: flex;
       flex-direction: column;
       align-items: center;
+      justify-content: center;
       gap: 3px;
-      padding: 5px 2px;
-      font-size: 10px;
+      padding: 6px 0;
+      font-size: 10.5px;
       font-weight: 700;
       cursor: pointer;
       font-family: inherit;
+      transition: color 0.15s ease, transform 0.1s ease;
+      text-align: center;
+      outline: none;
+      user-select: none;
     }
+    .nav-item:active { transform: scale(0.92); }
     .nav-item.active { color: var(--gold); }
-    .nav-item svg { width: 20px; height: 20px; stroke-width: 2.1; }
+    .nav-item svg { width: 21px; height: 21px; stroke-width: 2.1; display: block; margin: 0 auto; }
     input, select, textarea {
       width: 100%;
       background: #101014;
@@ -1155,9 +1323,9 @@ def _RENDER_SPA_HTML() -> str:
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 13h6M9 17h4"/></svg>
       <span>Negocios</span>
     </button>
-    <button class="nav-item" data-tab="visitas" onclick="switchTab('visitas')">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
-      <span>Visitas</span>
+    <button class="nav-item" data-tab="resenas" onclick="switchTab('resenas')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+      <span>Reseñas NFC</span>
     </button>
     <button class="nav-item" data-tab="perfil" onclick="switchTab('perfil')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 12 0v1"/><circle cx="19" cy="19" r="2"/></svg>
@@ -1188,6 +1356,13 @@ def _RENDER_SPA_HTML() -> str:
     };
 
     let FILTER_FORM = { q: '', scope: 'route' };
+    let RESENAS_STATE = {
+      query: '',
+      loading: false,
+      results: [],
+      selectedPlace: null,
+      error: ''
+    };
 
     function showToast(text) {
       const box = document.getElementById('toast-box');
@@ -1234,7 +1409,7 @@ def _RENDER_SPA_HTML() -> str:
       loading: true
     };
     let LOGIN_FORM = {
-      username: 'admin123',
+      username: '',
       password: '',
       loading: false,
       error: ''
@@ -1335,6 +1510,9 @@ def _RENDER_SPA_HTML() -> str:
       localStorage.removeItem('facenia_auth_token');
       AUTH_STATE.authenticated = false;
       AUTH_STATE.user = null;
+      LOGIN_FORM.username = '';
+      LOGIN_FORM.password = '';
+      LOGIN_FORM.error = '';
       STATE = null;
       render();
       showToast('Sesión cerrada correctamente');
@@ -1416,7 +1594,7 @@ def _RENDER_SPA_HTML() -> str:
 
               <div style="margin-bottom:16px;">
                 <label for="login-username" style="display:block;font-size:12px;color:var(--muted);font-weight:700;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em;">Usuario</label>
-                <input id="login-username" name="username" type="text" class="input-text" value="${escapeHtml(LOGIN_FORM.username)}" placeholder="admin123" autocomplete="username" required />
+                <input id="login-username" name="username" type="text" class="input-text" value="${escapeHtml(LOGIN_FORM.username)}" placeholder="Introduce tu usuario" autocomplete="username" required />
               </div>
 
               <div style="margin-bottom:22px;">
@@ -1478,6 +1656,7 @@ def _RENDER_SPA_HTML() -> str:
         setTimeout(initLeafletMap, 40);
       }
       else if (CURRENT_TAB === 'negocios') root.innerHTML = renderNegocios();
+      else if (CURRENT_TAB === 'resenas') root.innerHTML = renderResenas();
       else if (CURRENT_TAB === 'visitas') root.innerHTML = renderVisitas();
       else if (CURRENT_TAB === 'perfil') root.innerHTML = renderPerfil();
     }
@@ -1517,12 +1696,17 @@ def _RENDER_SPA_HTML() -> str:
           </div>
           <div style="display:flex;align-items:center;gap:6px;">
             <span class="mint-pill">${STATE.supabase_configured ? '✓ Supabase activo' : 'SQLite local'}</span>
-            <button class="circle-btn" onclick="handleLogout()" title="Cerrar sesión (${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'admin123')})" style="width:34px;height:34px;font-size:13px;color:var(--muted);background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);">⎋</button>
+            <button class="circle-btn" onclick="handleLogout()" title="Cerrar sesión (${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'Usuario')})" style="width:34px;height:34px;font-size:13px;color:var(--muted);background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);">⎋</button>
           </div>
         </div>
 
         <button class="btn-gold-cta" onclick="openCreateRoute()">
           + Nueva ruta comercial a pie
+        </button>
+
+        <button class="btn-white-pill" onclick="switchTab('resenas')" style="width:100%;margin-top:8px;padding:11px 14px;font-size:13px;display:flex;align-items:center;justify-content:center;gap:8px;border-color:rgba(226,179,37,0.35);background:rgba(226,179,37,0.06);color:var(--gold);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" style="width:16px;height:16px;"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          <span>Generador de Reseñas y Tarjetas NFC</span>
         </button>
 
         ${activeCard}
@@ -1892,14 +2076,22 @@ def _RENDER_SPA_HTML() -> str:
         `;
       }).join('');
 
+      const totalLeads = (STATE.leads || []).length;
       return `
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:6px;flex-wrap:wrap;">
           <span style="font-size:13px;color:var(--muted);font-weight:700;">
             ${useRoute ? `${visitedCount} de ${ar.stops.length} visitados` : `${filtered.length} locales en cartera`}
           </span>
-          <div class="seg-bar" style="width:190px;">
-            <button class="seg-btn ${useRoute ? 'active' : ''}" style="font-size:11px;padding:6px;" onclick="FILTER_FORM.scope='route';render();">Ruta actual</button>
-            <button class="seg-btn ${!useRoute ? 'active' : ''}" style="font-size:11px;padding:6px;" onclick="FILTER_FORM.scope='all';render();">Cartera (${(STATE.leads||[]).length})</button>
+          <div style="display:flex;align-items:center;gap:6px;">
+            ${!useRoute && totalLeads > 0 ? `
+              <button class="btn-white-pill" style="padding:6px 10px;font-size:11px;font-weight:700;color:#F87171;border-color:rgba(239,68,68,0.35);background:rgba(239,68,68,0.08);" onclick="deleteAllSites()">
+                🗑 Borrar todos (${totalLeads})
+              </button>
+            ` : ''}
+            <div class="seg-bar" style="width:190px;">
+              <button class="seg-btn ${useRoute ? 'active' : ''}" style="font-size:11px;padding:6px;" onclick="FILTER_FORM.scope='route';render();">Ruta actual</button>
+              <button class="seg-btn ${!useRoute ? 'active' : ''}" style="font-size:11px;padding:6px;" onclick="FILTER_FORM.scope='all';render();">Cartera (${totalLeads})</button>
+            </div>
           </div>
         </div>
 
@@ -1915,7 +2107,18 @@ def _RENDER_SPA_HTML() -> str:
 
         <input id="search-negocios" name="search_negocios" placeholder="Buscar local por nombre o categoría..." value="${escapeHtml(FILTER_FORM.q)}" oninput="FILTER_FORM.q=this.value;render();" style="margin-bottom:12px;" />
 
-        ${cards || '<div class="card">No hay locales en esta vista.</div>'}
+        ${cards || `
+          <div class="card" style="text-align:center;padding:28px 14px;">
+            <div style="font-size:26px;margin-bottom:8px;">📍</div>
+            <div style="font-size:15px;font-weight:700;color:#fff;">No hay locales que mostrar</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:4px;max-width:280px;margin-left:auto;margin-right:auto;line-height:1.45;">
+              ${useRoute ? 'Esta ruta no tiene paradas activas.' : 'Tu cartera está vacía. Genera una nueva ruta o busca negocios en Reseñas NFC para añadir locales.'}
+            </div>
+            <button class="btn-gold-cta" style="margin-top:14px;padding:9px 16px;font-size:13px;" onclick="${useRoute ? 'openCreateRoute()' : "switchTab('resenas')"}">
+              ${useRoute ? '+ Nueva ruta' : '⭐ Generador de Reseñas NFC'}
+            </button>
+          </div>
+        `}
       `;
     }
 
@@ -2169,6 +2372,138 @@ def _RENDER_SPA_HTML() -> str:
     }
 
     /* =====================================================================
+       PANTALLA: GENERADOR DE RESEÑAS GOOGLE Y TARJETAS NFC
+       ===================================================================== */
+    function renderResenas() {
+      const q = RESENAS_STATE.query || '';
+      const place = RESENAS_STATE.selectedPlace;
+      const candidates = RESENAS_STATE.results || [];
+      const hasMultiple = candidates.length > 1;
+
+      let resultsHtml = '';
+      if (RESENAS_STATE.loading) {
+        resultsHtml = `
+          <div class="card" style="text-align:center;padding:32px 16px;">
+            <div style="font-size:32px;margin-bottom:10px;">🔍</div>
+            <div style="font-size:15px;font-weight:700;color:#fff;">Buscando en Google Places...</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:4px;">Localizando ficha oficial y generando enlace directo de reseñas</div>
+          </div>
+        `;
+      } else if (RESENAS_STATE.error) {
+        resultsHtml = `
+          <div class="alert-error" style="margin-top:14px;">
+            ${escapeHtml(RESENAS_STATE.error)}
+          </div>
+        `;
+      } else if (place) {
+        const ratingNum = place.rating != null ? String(place.rating).replace('.', ',') : '★';
+        const totalReviews = place.user_ratings_total != null ? `(${place.user_ratings_total} reseñas)` : '';
+        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=10&data=${encodeURIComponent(place.review_url)}`;
+        const whatsappText = encodeURIComponent(`Hola, te comparto el enlace directo para dejar una reseña en Google de ${place.name}: ${place.review_url}`);
+
+        let candidatesSelector = '';
+        if (hasMultiple) {
+          candidatesSelector = `
+            <div style="margin-bottom:14px;">
+              <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">Resultados encontrados (${candidates.length})</div>
+              <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;">
+                ${candidates.map((c, i) => `
+                  <button class="btn-white-pill" style="font-size:11px;padding:6px 10px;white-space:nowrap;${c === place ? 'border-color:var(--gold);color:var(--gold);background:rgba(226,179,37,0.1);' : ''}" onclick="selectResenasPlace(${i})">
+                    ${escapeHtml(c.name.slice(0, 22))}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+          `;
+        }
+
+        resultsHtml = `
+          ${candidatesSelector}
+          <div class="card" style="border:1.5px solid var(--gold);box-shadow:0 8px 24px rgba(226,179,37,0.12);">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+              <div>
+                <span class="${place.is_direct ? 'mint-pill' : 'rose-pill'}" style="margin-bottom:6px;display:inline-block;">
+                  ${place.is_direct ? '✓ Enlace directo de reseñas oficial (Place ID)' : 'Búsqueda pública en Google Maps'}
+                </span>
+                <h2 style="font-size:18px;font-weight:800;margin:4px 0 2px;color:#fff;">${escapeHtml(place.name)}</h2>
+                <div style="font-size:12px;color:var(--muted);">${escapeHtml(place.address || 'Ubicación local')}</div>
+              </div>
+              ${place.rating != null ? `
+                <div style="text-align:right;">
+                  <div style="font-size:18px;font-weight:800;color:var(--gold);">${ratingNum} ★</div>
+                  <div style="font-size:11px;color:var(--muted);">${totalReviews}</div>
+                </div>
+              ` : ''}
+            </div>
+
+            <!-- Caja Enlace -->
+            <label style="margin-top:14px;">Enlace directo de reseñas de Google</label>
+            <div style="background:#0D0D10;border:1px solid rgba(74,222,128,0.3);border-radius:10px;padding:10px 12px;margin-top:4px;word-break:break-all;font-family:'JetBrains Mono',monospace;font-size:11px;color:#4ADE80;user-select:all;">
+              ${escapeHtml(place.review_url)}
+            </div>
+
+            <!-- Botones de Acción -->
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px;">
+              <button class="btn-gold-cta" style="padding:10px;font-size:13px;" onclick="copyReviewUrl('${escapeHtml(place.review_url)}')">
+                📋 Copiar enlace
+              </button>
+              <a class="btn-white-pill" style="padding:10px;font-size:13px;text-align:center;text-decoration:none;" href="${escapeHtml(place.review_url)}" target="_blank" rel="noopener">
+                ↗ Probar en Google
+              </a>
+              <a class="btn-white-pill" style="padding:10px;font-size:13px;text-align:center;text-decoration:none;color:#4ADE80;border-color:rgba(74,222,128,0.3);" href="https://api.whatsapp.com/send?text=${whatsappText}" target="_blank" rel="noopener">
+                📲 WhatsApp
+              </a>
+              <button class="btn-white-pill" style="padding:10px;font-size:13px;" onclick="savePlaceToCartera(RESENAS_STATE.selectedPlace)">
+                + Guardar en cartera
+              </button>
+            </div>
+
+            <!-- Código QR -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:14px;margin-top:16px;text-align:center;">
+              <div style="font-size:12px;font-weight:700;color:#fff;margin-bottom:8px;">Código QR para escanear y probar</div>
+              <img src="${qrUrl}" alt="QR de Reseñas" style="width:150px;height:150px;border-radius:10px;background:#fff;padding:6px;display:block;margin:0 auto;" />
+              <div style="font-size:11px;color:var(--muted);margin-top:8px;">Muestra este QR al cliente para que abra la ventana de reseña con su cámara.</div>
+            </div>
+
+            <!-- Guía de grabación NFC -->
+            <div style="background:rgba(226,179,37,0.05);border:1px solid rgba(226,179,37,0.25);border-radius:14px;padding:14px;margin-top:14px;">
+              <div style="font-size:12px;font-weight:800;color:var(--gold);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px;">
+                Cómo grabar la Tarjeta NFC con NFC Tools
+              </div>
+              <div style="font-size:12px;color:#E5E7EB;line-height:1.55;display:flex;flex-direction:column;gap:6px;">
+                <div><strong>1.</strong> Instala la app gratuita <em>NFC Tools</em> (Android o iPhone).</div>
+                <div><strong>2.</strong> Pulsa en <strong>Escribir</strong> → <strong>Añadir un registro</strong> → <strong>URL / Enlace</strong>.</div>
+                <div><strong>3.</strong> Pega el enlace copiado arriba y pulsa <strong>Aceptar</strong> y luego <strong>Escribir</strong>.</div>
+                <div><strong>4.</strong> Acerca la tarjeta o pegatina NFC al teléfono. ¡Grabada y lista para el cliente!</div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="top-nav-row">
+          <div>
+            <div style="font-size:11px;font-weight:800;color:var(--gold);letter-spacing:0.08em;text-transform:uppercase;">FACENIA · HERRAMIENTA COMERCIAL</div>
+            <h1 class="screen-title">Reseñas y Tarjetas NFC</h1>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:14px;">
+          <div style="font-size:13px;color:var(--muted);margin-bottom:12px;line-height:1.45;">
+            Busca cualquier local por su nombre o dirección para obtener su enlace oficial de reseñas de Google y codificar tarjetas NFC en segundos.
+          </div>
+          <div style="display:flex;gap:8px;">
+            <input id="resenas-search-input" type="text" placeholder="Ej: Pimpi Málaga, Café Central, Peluquería..." value="${escapeHtml(q)}" onkeydown="if(event.key==='Enter') searchResenasPlace();" style="margin:0;" />
+            <button class="btn-gold-cta" onclick="searchResenasPlace()" style="padding:0 16px;white-space:nowrap;font-size:13px;">Buscar</button>
+          </div>
+        </div>
+
+        ${resultsHtml}
+      `;
+    }
+
+    /* =====================================================================
        VISITAS Y PERFIL
        ===================================================================== */
     function renderVisitas() {
@@ -2210,8 +2545,10 @@ def _RENDER_SPA_HTML() -> str:
     function renderPerfil() {
       const cfg = STATE.settings || {};
       const u = STATE.api_usage || {};
+      const s = STATE.stats || {};
       const gOk = STATE.google_Configured;
       const sbOk = STATE.supabase_configured;
+      const totalLeads = (STATE.leads || []).length;
 
       return `
         <div class="top-nav-row">
@@ -2222,10 +2559,28 @@ def _RENDER_SPA_HTML() -> str:
           <div class="card-title">Sesión activa</div>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;">
             <div>
-              <div style="font-size:15px;font-weight:700;color:#FFF;">${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'admin123')}</div>
+              <div style="font-size:15px;font-weight:700;color:#FFF;">${escapeHtml(AUTH_STATE.user ? AUTH_STATE.user.username : 'Usuario')}</div>
               <div style="font-size:12px;color:var(--muted);margin-top:2px;">Rol: Administrador · Base de datos</div>
             </div>
             <button class="btn-white-pill" onclick="handleLogout()" style="color:#F87171;border-color:rgba(239,68,68,0.3);padding:8px 14px;font-size:12px;">Cerrar sesión</button>
+          </div>
+        </div>
+
+        <!-- Resumen de visitas y métricas -->
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div class="card-title" style="margin:0;">Tus números y visitas</div>
+            <button class="btn-white-pill" style="padding:6px 10px;font-size:11px;" onclick="undoLastVisit()">Deshacer última</button>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
+            <div style="background:var(--surface-2);border-radius:12px;padding:12px;text-align:center;">
+              <div style="font-size:11px;color:var(--muted);">Visitas realizadas</div>
+              <div style="font-size:24px;font-weight:800;margin-top:2px;">${s.visited_count || 0}</div>
+            </div>
+            <div style="background:var(--surface-2);border-radius:12px;padding:12px;text-align:center;">
+              <div style="font-size:11px;color:var(--muted);">Ventas cerradas</div>
+              <div style="font-size:24px;font-weight:800;color:#4ADE80;margin-top:2px;">${s.sales_count || 0}</div>
+            </div>
           </div>
         </div>
 
@@ -2279,6 +2634,17 @@ def _RENDER_SPA_HTML() -> str:
             <a class="btn-white-pill" style="flex:1;padding:12px;" href="/api/export/csv" download>CSV Notion</a>
             <a class="btn-gold-cta" style="flex:1;padding:12px;font-size:14px;" href="/api/export/excel" download>Excel (.xlsx)</a>
           </div>
+        </div>
+
+        <!-- Zona de Peligro / Mantenimiento -->
+        <div class="card" style="border:1px solid rgba(239,68,68,0.3);background:rgba(239,68,68,0.03);">
+          <div class="card-title" style="color:#FCA5A5;">Gestión de datos de cartera</div>
+          <div style="font-size:12px;color:var(--muted);line-height:1.45;">
+            Si deseas reiniciar tus prospecciones o limpiar los locales guardados, puedes vaciar la cartera por completo.
+          </div>
+          <button class="btn-white-pill" style="width:100%;padding:11px;font-size:13px;color:#F87171;border-color:rgba(239,68,68,0.4);background:rgba(239,68,68,0.06);margin-top:10px;" onclick="deleteAllSites()">
+            🗑 Borrar todos los sitios de la cartera (${totalLeads} locales)
+          </button>
         </div>
       `;
     }
@@ -2437,6 +2803,103 @@ def _RENDER_SPA_HTML() -> str:
         }
       } catch (e) {
         showToast('Error al quitar de la ruta');
+      }
+    }
+
+    async function deleteAllSites() {
+      const total = (STATE.leads || []).length;
+      if (total === 0) {
+        showToast('La cartera ya está vacía');
+        return;
+      }
+      if (!confirm(`¿Estás seguro de que quieres borrar TODOS los ${total} negocios encontrados? Esta acción vaciará por completo la cartera y no se puede deshacer.`)) {
+        return;
+      }
+      try {
+        const res = await apiFetch('/api/leads/delete-all', { method: 'POST' });
+        const data = await res.json();
+        if (data.ok) {
+          if (data.state) STATE = data.state;
+          if (SUBSCREEN === 'ficha_negocio') SUBSCREEN = null;
+          showToast(`✓ Se han eliminado ${data.deleted || total} negocios`);
+          render();
+        } else {
+          showToast(data.error || 'No se pudo vaciar la cartera');
+        }
+      } catch (e) {
+        showToast('Error al borrar los negocios');
+      }
+    }
+
+    async function searchResenasPlace() {
+      const inp = document.getElementById('resenas-search-input');
+      const q = (inp ? inp.value : RESENAS_STATE.query).trim();
+      if (!q) {
+        showToast('Introduce el nombre del negocio');
+        return;
+      }
+      RESENAS_STATE.query = q;
+      RESENAS_STATE.loading = true;
+      RESENAS_STATE.error = '';
+      RESENAS_STATE.results = [];
+      RESENAS_STATE.selectedPlace = null;
+      render();
+
+      try {
+        const res = await apiFetch('/api/reviews/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q })
+        });
+        const data = await res.json();
+        RESENAS_STATE.loading = false;
+        if (data.ok && data.results && data.results.length > 0) {
+          RESENAS_STATE.results = data.results;
+          RESENAS_STATE.selectedPlace = data.results[0];
+        } else {
+          RESENAS_STATE.error = 'No se encontró ningún negocio con ese nombre. Prueba indicando la ciudad (ej: Bar El Pimpi Málaga).';
+        }
+      } catch (e) {
+        RESENAS_STATE.loading = false;
+        RESENAS_STATE.error = 'Error de conexión al buscar el negocio.';
+      }
+      render();
+    }
+
+    function selectResenasPlace(idx) {
+      if (RESENAS_STATE.results && RESENAS_STATE.results[idx]) {
+        RESENAS_STATE.selectedPlace = RESENAS_STATE.results[idx];
+        render();
+      }
+    }
+
+    async function savePlaceToCartera(place) {
+      if (!place) return;
+      try {
+        const res = await apiFetch('/api/leads/save-single', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(place)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          if (data.state) STATE = data.state;
+          showToast('✓ Guardado en tu cartera de BuscaLeads');
+          render();
+        } else {
+          showToast(data.error || 'No se pudo guardar');
+        }
+      } catch (e) {
+        showToast('Error al guardar en cartera');
+      }
+    }
+
+    function copyReviewUrl(url) {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(url);
+        showToast('✓ Enlace copiado al portapapeles');
+      } else {
+        showToast(url);
       }
     }
 

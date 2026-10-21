@@ -43,6 +43,7 @@ from config import (
 )
 from database import (
     backup_database,
+    delete_all_leads,
     delete_lead,
     get_api_usage_stats,
     get_lead,
@@ -413,7 +414,7 @@ if not st.session_state.authenticated:
         unsafe_allow_html=True,
     )
     with st.form("login_form", clear_on_submit=False):
-        u = st.text_input("Usuario", value="admin123", key="login_username_input")
+        u = st.text_input("Usuario", value="", placeholder="Introduce tu usuario", key="login_username_input")
         p = st.text_input("Contraseña", type="password", key="login_password_input")
         submitted = st.form_submit_button("Iniciar sesión →", use_container_width=True, type="primary")
         if submitted:
@@ -1452,6 +1453,13 @@ elif st.session_state.nav_tab == "negocios":
                         1,
                     )
 
+        if selected_scope != "Ruta activa" and base_leads:
+            _, col_clear = st.columns([2, 1])
+            if col_clear.button("Vaciar cartera", icon=":material/delete_sweep:", type="secondary", key="btn_clear_all_leads", width="stretch"):
+                cnt = delete_all_leads()
+                st.session_state.flash_message = f"Se han eliminado {cnt} negocios de la cartera."
+                st.rerun()
+
         search_name_q = st.text_input(
             "Buscar negocio por nombre, calle o categoría",
             placeholder="Buscar por nombre, calle, categoría o teléfono...",
@@ -1903,7 +1911,7 @@ elif st.session_state.nav_tab == "perfil":
     # 0. Sesión activa
     with st.container(border=True):
         st.markdown("**:material/account_circle: Sesión activa**")
-        user_name = (st.session_state.auth_user or {}).get("username", "admin123")
+        user_name = (st.session_state.auth_user or {}).get("username", "Usuario")
         u_col1, u_col2 = st.columns([2, 1])
         u_col1.caption(f"Usuario autenticado: **{user_name}** · Rol: **Administrador** (Base de datos)")
         if u_col2.button("Cerrar sesión", icon=":material/logout:", key="btn_logout_user", use_container_width=True):

@@ -266,3 +266,18 @@ def sync_delete_lead_to_supabase(lead_id: int, db_path: Optional[str] = None) ->
         )
     except Exception:
         pass
+
+
+def sync_delete_all_leads_to_supabase(db_path: Optional[str] = None) -> None:
+    """Elimina todos los negocios en Supabase para mantener sincronización exacta."""
+    if not _is_main_db(db_path):
+        return
+    try:
+        requests.delete(
+            _rest_url("buscaleads_leads"),
+            params={"id": "gt.0"},
+            headers=_headers("return=minimal"),
+            timeout=8,
+        )
+    except Exception:
+        pass
